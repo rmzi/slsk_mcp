@@ -7,10 +7,13 @@ import json
 import logging
 import os
 import sys
+from pathlib import Path
 from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
 
+from . import mirror as _mirror
+from . import tidal as _tidal
 from .models import (
     ErrorResponse,
     SearchResponse,
@@ -288,6 +291,92 @@ async def peer_status(username: str) -> dict:
     except Exception as exc:
         logger.exception("Network operation failed")
         return ErrorResponse(code="network_error", message=_generic_error_message(exc)).model_dump()
+
+
+# ── Tidal → Soulseek mirror tools ────────────────────────────────────────────
+
+
+@mcp.tool()
+async def tidal_login_status() -> dict:
+    """Check whether a Tidal session is cached and valid.
+
+    Tidal requires a one-time OAuth device-code login to authorize the MCP.
+    If logged_in=False, the user must run the `slsk-mcp-tidal-login` CLI
+    once on the host machine. After that the refresh token is cached and
+    this MCP reads Tidal silently.
+    """
+    session = _tidal.load_session()
+    session_path = str(_tidal.get_session_path())
+    if session is None:
+        return {
+            "logged_in": False,
+            "session_file": session_path,
+            "bootstrap_command": "slsk-mcp-tidal-login",
+        }
+    user = getattr(session, "user", None)
+    return {
+        "logged_in": True,
+        "session_file": session_path,
+        "user": getattr(user, "username", None) if user else None,
+    }
+
+
+@mcp.tool()
+async def mirror_tidal_playlist(url: str) -> dict:
+    """Mirror a Tidal playlist to Soulseek.
+
+    For each track: search Soulseek, prefer FLAC, fall back to 320 CBR MP3,
+    otherwise record the track in the failures log. Downloads are written
+    to a subfolder of SLSK_DOWNLOAD_DIR named after the playlist; a
+    `_failures.json` file summarises anything that couldn't be matched.
+
+    Returns immediately with a job_id. The pipeline runs in the background
+    — call `playlist_job_status(job_id)` to check progress.
+    """
+    try:
+        await _connect()
+    except RuntimeError as exc:
+        logger.exception("Authentication required")
+        return ErrorResponse(
+            code="not_authenticated", message=_generic_error_message(exc)
+        ).model_dump()
+
+    download_root = Path(os.environ.get("SLSK_DOWNLOAD_DIR", "./downloads"))
+    try:
+        job_id = await _mirror.start_mirror(
+            url=url, slsk=_W, download_root=download_root
+        )
+    except ValueError as exc:
+        return ErrorResponse(code="invalid_params", message=str(exc)).model_dump()
+    except RuntimeError as exc:
+        return ErrorResponse(
+            code="not_authenticated", message=str(exc)
+        ).model_dump()
+    except Exception as exc:
+        logger.exception("mirror_tidal_playlist failed")
+        return ErrorResponse(
+            code="network_error", message=_generic_error_message(exc)
+        ).model_dump()
+
+    status = _mirror.get_job(job_id) or {}
+    return {"job_id": job_id, **status}
+
+
+@mcp.tool()
+async def playlist_job_status(job_id: str) -> dict:
+    """Poll a mirror_tidal_playlist job.
+
+    Returns per-track outcomes plus aggregate counts. Each outcome has one
+    of: queued | downloading | finished | failed | skipped. When the job
+    reaches status='complete', a `_failures.json` file is written under
+    the playlist directory.
+    """
+    status = _mirror.get_job(job_id)
+    if status is None:
+        return ErrorResponse(
+            code="invalid_params", message="job_id not found"
+        ).model_dump()
+    return status
 
 
 # ── Search Tips (served via slsk://search_tips resource) ─────────────────────
