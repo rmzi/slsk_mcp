@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import aioslsk.network.network as _aioslsk_network
 from aioslsk.client import SoulSeekClient
 from aioslsk.settings import Settings, CredentialsSettings, ListeningConnectionErrorMode
 from aioslsk.search.model import SearchRequest as SlskSearchRequest
@@ -21,6 +22,35 @@ from .models import (
 )
 
 logger = logging.getLogger("slsk_mcp")
+
+# Security hardening: override aioslsk's 0.0.0.0 default so we don't expose
+# the P2P listener to the LAN/WAN by default. User can opt back into the
+# upstream behavior with SLSK_BIND_HOST=0.0.0.0.
+_aioslsk_network.DEFAULT_LISTENING_HOST = os.environ.get("SLSK_BIND_HOST", "127.0.0.1")
+
+# Default file-size cap (10 GiB). Protects against a malicious peer advertising
+# a multi-TB file and filling the disk. Override via SLSK_MAX_FILESIZE_BYTES.
+_DEFAULT_MAX_FILESIZE_BYTES = 10 * 1024 * 1024 * 1024
+
+# Cap on peer-controlled strings returned to the LLM. Soulseek filenames can
+# carry anything a peer types; untrusted text is a prompt-injection vector.
+_LLM_TEXT_MAX_LEN = 500
+
+
+def _sanitize_for_llm(text: Any, max_len: int = _LLM_TEXT_MAX_LEN) -> str:
+    """Neutralize peer-controlled strings before surfacing them to the LLM.
+
+    Strips C0/DEL control chars (which can confuse tokenizers and smuggle
+    instructions) and bounds the length so a single malicious filename can't
+    flood the agent's context window.
+    """
+    if text is None:
+        return ""
+    s = text if isinstance(text, str) else str(text)
+    cleaned = "".join(ch if (0x20 <= ord(ch) < 0x7f) or ord(ch) > 0xa0 else " " for ch in s)
+    if len(cleaned) > max_len:
+        cleaned = cleaned[:max_len] + "…"
+    return cleaned
 
 # aioslsk FileData attribute keys
 ATTR_AUDIO_QUALITY = 0
@@ -186,7 +216,17 @@ class SoulseekWrapper:
             settings.network.listening.port = listen_port
         if obfuscated_port:
             settings.network.listening.obfuscated_port = obfuscated_port
-        logger.info("Listening settings: port=%s, error_mode=%s", settings.network.listening.port, settings.network.listening.error_mode)
+        # Security hardening: aioslsk enables UPnP IGD port-mapping by default,
+        # which auto-punches a hole through the user's router. Require an
+        # explicit opt-in (SLSK_ENABLE_UPNP=1) before doing that.
+        settings.network.upnp.enabled = os.environ.get("SLSK_ENABLE_UPNP", "").lower() in ("1", "true", "yes")
+        logger.info(
+            "Listening settings: host=%s port=%s upnp=%s error_mode=%s",
+            _aioslsk_network.DEFAULT_LISTENING_HOST,
+            settings.network.listening.port,
+            settings.network.upnp.enabled,
+            settings.network.listening.error_mode,
+        )
 
         download_dir = os.environ.get("SLSK_DOWNLOAD_DIR", "./downloads")
         settings.shares.download = download_dir
@@ -196,14 +236,14 @@ class SoulseekWrapper:
         try:
             await self._client.start()
             await self._client.login()
-        except Exception as exc:
-            logger.error("Login failed: %s", exc)
+        except Exception:
+            logger.exception("Login failed")
             try:
                 await self._client.stop()
             except Exception:
                 pass
             self._client = None
-            return False, f"Login failed: {exc}", False
+            return False, "Login failed (see server logs for details)", False
 
         # Detect passive mode: if no listening ports were bound
         self._passive_mode = not self._has_listening_ports()
@@ -357,10 +397,10 @@ class SoulseekWrapper:
                 items.append(
                     SearchResultItem(
                         id=file_id,
-                        username=username,
-                        filename=filename,
+                        username=_sanitize_for_llm(username),
+                        filename=_sanitize_for_llm(filename),
                         filesize=shared_item.filesize,
-                        extension=ext,
+                        extension=_sanitize_for_llm(ext, max_len=16),
                         has_free_slots=result.has_free_slots,
                         avg_speed=result.avg_speed,
                         queue_size=result.queue_size,
@@ -412,6 +452,24 @@ class SoulseekWrapper:
                     username, remote_path
                 )
 
+            filesize = transfer.filesize if hasattr(transfer, 'filesize') else None
+
+            # Reject peer-advertised filesizes over the configured cap before
+            # we let aioslsk allocate disk for them.
+            max_bytes = int(os.environ.get("SLSK_MAX_FILESIZE_BYTES", str(_DEFAULT_MAX_FILESIZE_BYTES)))
+            if filesize is not None and filesize > max_bytes:
+                try:
+                    await self._client.transfers.abort(transfer)
+                except Exception:
+                    pass
+                self._download_sem.release()
+                return (
+                    False,
+                    f"File too large: {filesize} bytes exceeds configured limit {max_bytes} (set SLSK_MAX_FILESIZE_BYTES to override)",
+                    None,
+                    filesize,
+                )
+
             # Build the final path and set .part path on the transfer so
             # aioslsk writes to the .part file directly.
             filename = remote_path.rsplit("\\", 1)[-1].rsplit("/", 1)[-1]
@@ -427,7 +485,6 @@ class SoulseekWrapper:
             part_path = final_path.with_suffix(suffix + ".part")
             transfer.local_path = str(part_path)
 
-            filesize = transfer.filesize if hasattr(transfer, 'filesize') else None
             self._downloads[file_id] = {
                 "transfer": transfer,
                 "local_path": str(final_path),
@@ -444,7 +501,8 @@ class SoulseekWrapper:
             return True, "Download started", str(final_path), filesize
         except Exception as exc:
             self._download_sem.release()
-            return False, f"Download failed: {exc}", None, None
+            logger.exception("Download setup failed for %s", file_id)
+            return False, "Download failed (see server logs for details)", None, None
 
     async def _watch_transfer(self, file_id: str) -> None:
         """Wait for a transfer to finish, rename .part → final on success."""

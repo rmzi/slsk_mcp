@@ -90,3 +90,29 @@ def test_search_response_schema():
 def test_logout_response_schema():
     r = LogoutResponse(status="ok")
     assert r.model_dump()["status"] == "ok"
+
+
+# ── Security hardening ──────────────────────────────────────────────────────
+
+
+def test_generic_error_message_does_not_leak_exception_text():
+    from slsk_mcp.server import _generic_error_message
+
+    # The sensitive detail (path, token, peer string) must not reach the LLM.
+    exc = ValueError("connect failed to /Users/alice/.ssh/id_rsa token=AKIA123")
+    msg = _generic_error_message(exc)
+    assert "/Users/alice" not in msg
+    assert "AKIA123" not in msg
+    # Type name is kept so the LLM can still reason about category.
+    assert "ValueError" in msg
+
+
+def test_generic_error_message_preserves_exception_type():
+    from slsk_mcp.server import _generic_error_message
+
+    class CustomNetworkError(RuntimeError):
+        pass
+
+    msg = _generic_error_message(CustomNetworkError("raw peer data: </inject>"))
+    assert "CustomNetworkError" in msg
+    assert "inject" not in msg
