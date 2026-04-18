@@ -60,8 +60,15 @@ async def _with_retry(coro_factory):
         if await _W.reconnect():
             return await coro_factory()
         raise RuntimeError(
-            f"Session lost and reconnect failed. Original error: {first_err}"
+            "Session lost and reconnect failed (see server logs for details)"
         ) from first_err
+
+
+def _generic_error_message(exc: Exception) -> str:
+    """Surface an exception type to the LLM without leaking its stringified
+    contents (which may include peer data, paths, or credentials from aioslsk).
+    """
+    return f"{type(exc).__name__} (see server logs for details)"
 
 
 # ── MCP server (no lifespan) ─────────────────────────────────────────────────
@@ -97,7 +104,8 @@ async def search(
     try:
         await _connect()
     except RuntimeError as exc:
-        return ErrorResponse(code="not_authenticated", message=str(exc)).model_dump()
+        logger.exception("Authentication required")
+        return ErrorResponse(code="not_authenticated", message=_generic_error_message(exc)).model_dump()
 
     if timeout < 7:
         timeout = 7
@@ -117,7 +125,8 @@ async def search(
         ))
         return SearchResponse(count=len(results), results=results).model_dump()
     except Exception as exc:
-        return ErrorResponse(code="network_error", message=str(exc)).model_dump()
+        logger.exception("Network operation failed")
+        return ErrorResponse(code="network_error", message=_generic_error_message(exc)).model_dump()
 
 
 @mcp.tool()
@@ -137,7 +146,8 @@ async def download(id: str) -> dict:
     try:
         await _connect()
     except RuntimeError as exc:
-        return ErrorResponse(code="not_authenticated", message=str(exc)).model_dump()
+        logger.exception("Authentication required")
+        return ErrorResponse(code="not_authenticated", message=_generic_error_message(exc)).model_dump()
 
     try:
         ok, message, local_path, filesize = await _with_retry(
@@ -152,7 +162,8 @@ async def download(id: str) -> dict:
             ).model_dump()
         return ErrorResponse(code="peer_timeout", message=message).model_dump()
     except Exception as exc:
-        return ErrorResponse(code="network_error", message=str(exc)).model_dump()
+        logger.exception("Network operation failed")
+        return ErrorResponse(code="network_error", message=_generic_error_message(exc)).model_dump()
 
 
 @mcp.tool()
@@ -172,7 +183,8 @@ async def download_status(id: str) -> dict:
     try:
         await _connect()
     except RuntimeError as exc:
-        return ErrorResponse(code="not_authenticated", message=str(exc)).model_dump()
+        logger.exception("Authentication required")
+        return ErrorResponse(code="not_authenticated", message=_generic_error_message(exc)).model_dump()
 
     return _W.download_status(id).model_dump()
 
@@ -191,7 +203,8 @@ async def cancel_download(id: str) -> dict:
     try:
         await _connect()
     except RuntimeError as exc:
-        return ErrorResponse(code="not_authenticated", message=str(exc)).model_dump()
+        logger.exception("Authentication required")
+        return ErrorResponse(code="not_authenticated", message=_generic_error_message(exc)).model_dump()
 
     result = await _W.cancel_download(id)
     return CancelDownloadResponse(
@@ -214,7 +227,8 @@ async def list_downloads() -> dict:
     try:
         await _connect()
     except RuntimeError as exc:
-        return ErrorResponse(code="not_authenticated", message=str(exc)).model_dump()
+        logger.exception("Authentication required")
+        return ErrorResponse(code="not_authenticated", message=_generic_error_message(exc)).model_dump()
 
     return {"downloads": _W.all_downloads()}
 
@@ -237,7 +251,8 @@ async def connection_health() -> dict:
     try:
         await _connect()
     except RuntimeError as exc:
-        return ErrorResponse(code="not_authenticated", message=str(exc)).model_dump()
+        logger.exception("Authentication required")
+        return ErrorResponse(code="not_authenticated", message=_generic_error_message(exc)).model_dump()
 
     return _W.connection_status()
 
@@ -264,13 +279,15 @@ async def peer_status(username: str) -> dict:
     try:
         await _connect()
     except RuntimeError as exc:
-        return ErrorResponse(code="not_authenticated", message=str(exc)).model_dump()
+        logger.exception("Authentication required")
+        return ErrorResponse(code="not_authenticated", message=_generic_error_message(exc)).model_dump()
 
     try:
         result = await _with_retry(lambda: _W.peer_status(username))
         return result.model_dump()
     except Exception as exc:
-        return ErrorResponse(code="network_error", message=str(exc)).model_dump()
+        logger.exception("Network operation failed")
+        return ErrorResponse(code="network_error", message=_generic_error_message(exc)).model_dump()
 
 
 # ── Search Tips (served via slsk://search_tips resource) ─────────────────────
