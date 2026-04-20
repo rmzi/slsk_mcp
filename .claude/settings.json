@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(uv sync *)",
+      "Bash(.venv/bin/pip install *)",
+      "Bash(git fetch *)",
+      "Bash(git push *)"
+    ]
+  }
+}
