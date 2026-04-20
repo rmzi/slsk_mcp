@@ -1,6 +1,6 @@
 [project]
 name = "slsk-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "Soulseek MCP server — search and download music via Model Context Protocol"
 requires-python = ">=3.10"
 dependencies = [
