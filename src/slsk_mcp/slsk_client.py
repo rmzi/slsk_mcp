@@ -23,6 +23,12 @@ from .models import (
 
 logger = logging.getLogger("slsk_mcp")
 
+
+def get_download_dir() -> Path:
+    """SLSK_DOWNLOAD_DIR with ``~`` and env vars expanded (default ./downloads)."""
+    raw = os.environ.get("SLSK_DOWNLOAD_DIR", "./downloads")
+    return Path(os.path.expandvars(os.path.expanduser(raw)))
+
 # Security hardening: override aioslsk's 0.0.0.0 default so we don't expose
 # the P2P listener to the LAN/WAN by default. User can opt back into the
 # upstream behavior with SLSK_BIND_HOST=0.0.0.0.
@@ -228,7 +234,7 @@ class SoulseekWrapper:
             settings.network.listening.error_mode,
         )
 
-        download_dir = os.environ.get("SLSK_DOWNLOAD_DIR", "./downloads")
+        download_dir = str(get_download_dir())
         settings.shares.download = download_dir
 
         self._client = SoulSeekClient(settings)
@@ -473,7 +479,7 @@ class SoulseekWrapper:
             # Build the final path and set .part path on the transfer so
             # aioslsk writes to the .part file directly.
             filename = remote_path.rsplit("\\", 1)[-1].rsplit("/", 1)[-1]
-            dl_dir = Path(os.environ.get("SLSK_DOWNLOAD_DIR", "./downloads"))
+            dl_dir = get_download_dir()
             dl_dir.mkdir(parents=True, exist_ok=True)
             final_path = dl_dir / filename
             # Resolve collision on the final name

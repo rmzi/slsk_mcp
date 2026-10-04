@@ -152,3 +152,12 @@ def test_default_max_filesize_is_reasonable():
     # enough for full-album FLAC sets but cheap enough that a malicious peer can't
     # fill a typical disk in one download.
     assert 1 * 1024**3 <= _DEFAULT_MAX_FILESIZE_BYTES <= 100 * 1024**3
+
+
+def test_get_download_dir_expands_tilde(monkeypatch):
+    import os
+    from slsk_mcp.slsk_client import get_download_dir
+
+    monkeypatch.setenv("SLSK_DOWNLOAD_DIR", "~/Music/slsk")
+    assert str(get_download_dir()) == os.path.expanduser("~/Music/slsk")
+    assert "~" not in str(get_download_dir())

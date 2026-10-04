@@ -22,7 +22,7 @@ from .models import (
     CancelDownloadResponse,
     PeerStatusResponse,
 )
-from .slsk_client import SoulseekWrapper
+from .slsk_client import SoulseekWrapper, get_download_dir
 
 logger = logging.getLogger("slsk_mcp")
 logging.basicConfig(level=logging.INFO, stream=sys.stderr)
@@ -269,7 +269,7 @@ async def get_config() -> dict:
     """
     return {
         "username": os.environ.get("SLSK_USERNAME", ""),
-        "download_dir": os.environ.get("SLSK_DOWNLOAD_DIR", "./downloads"),
+        "download_dir": str(get_download_dir()),
         "listen_port": os.environ.get("SLSK_LISTEN_PORT", "(default 60000)"),
         "obfuscated_port": os.environ.get("SLSK_OBFUSCATED_PORT", "(default 60001)"),
         "max_concurrent_downloads": int(os.environ.get("SLSK_MAX_CONCURRENT_DL", "2")),
@@ -347,7 +347,7 @@ async def mirror_tidal_playlist(
             code="not_authenticated", message=_generic_error_message(exc)
         ).model_dump()
 
-    download_root = Path(os.environ.get("SLSK_DOWNLOAD_DIR", "./downloads"))
+    download_root = get_download_dir()
     try:
         job_id = await _mirror.start_mirror(
             url=url, slsk=_W, download_root=download_root, formats=formats
