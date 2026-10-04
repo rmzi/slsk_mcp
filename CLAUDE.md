@@ -41,6 +41,7 @@ Retries and fallback (all env-tunable):
 - Searches that return zero raw results are retried (`SLSK_MIRROR_SEARCH_ATTEMPTS`, default 3; waits 30s then 120s). Soulseek has transient search outages lasting minutes where every query returns nothing. If results come back but none pass the quality filters, there is no retry — it would return the same thing.
 - Each track keeps a ranked candidate list. A download that fails, receives no bytes for `SLSK_MIRROR_QUEUE_TIMEOUT` (300s), or stalls for `SLSK_MIRROR_STALL_TIMEOUT` (120s) is cancelled (its `.part` removed) and the next candidate is tried, up to `SLSK_MIRROR_MAX_CANDIDATES` (3).
 - Downloads are written into the playlist folder itself, and each track task watches its own transfer from the start, so the client's 60s finished-record TTL can't cause false `not_found` failures.
+- Search outages: after `SLSK_MIRROR_OUTAGE_THRESHOLD` (5) consecutive zero-result searches across the job, the mirror forces a Soulseek re-login (`SoulseekWrapper.force_relogin`; at most once per 120s, capped by `SLSK_MIRROR_MAX_RELOGINS`, default 5). Observed: a session's searches can die for many minutes while a fresh login works at once. Downloads killed by the re-login retry the same peer once.
 - "Already downloaded" = a file in the playlist folder whose name contains the normalised track title (with or without bracketed suffixes). Re-running a playlist only fetches what's missing.
 
 ### One-time Tidal OAuth bootstrap

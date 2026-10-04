@@ -336,6 +336,26 @@ class SoulseekWrapper:
             logger.error("Reconnect failed: %s", msg)
         return ok
 
+    async def force_relogin(self) -> bool:
+        """Tear down the session and log in again, even if it looks healthy.
+
+        ``reconnect`` is a no-op while connected; this is for cases where the
+        session is up but misbehaving (e.g. every search returning nothing).
+        In-flight downloads from the old session become ``session_expired``.
+        """
+        user, pw = self._username, self._password
+        if not user or not pw:
+            return False
+        logger.warning("Forcing Soulseek re-login as %s", user)
+        async with self._conn_lock:
+            await self.logout()
+            ok, msg, _ = await self._login_inner(user, pw)
+        if ok:
+            logger.info("Forced re-login succeeded (session=%d)", self._session_id)
+        else:
+            logger.error("Forced re-login failed: %s", msg)
+        return ok
+
     # ── Search ───────────────────────────────────────────────────────────
 
     async def search(self, query: str, **kwargs: Any) -> List[SearchResultItem]:
@@ -508,6 +528,9 @@ class SoulseekWrapper:
                 "finished_at": None,
                 "session_id": self._session_id,
                 "started_at": time.time(),
+                # The semaphore this download holds a slot on. A re-login
+                # replaces self._download_sem, so release must go to this one.
+                "sem": self._download_sem,
             }
             # Release semaphore when transfer completes (fire-and-forget)
             asyncio.get_event_loop().create_task(
@@ -525,10 +548,16 @@ class SoulseekWrapper:
         if not entry:
             return
         transfer: Transfer = entry["transfer"]
+        sem = entry.get("sem") or self._download_sem
+        state = "queued"
         try:
             while True:
                 state = self._transfer_state(transfer)
                 if state in ("finished", "failed", "cancelled"):
+                    break
+                # Session replaced (re-login): this transfer is dead.
+                if entry.get("session_id", 0) < self._session_id:
+                    state = "session_expired"
                     break
                 await asyncio.sleep(1)
             # Rename .part → final on success
@@ -539,8 +568,8 @@ class SoulseekWrapper:
                     part.rename(final)
                     logger.info("Renamed %s → %s", part.name, final.name)
         finally:
-            if self._download_sem:
-                self._download_sem.release()
+            if sem:
+                sem.release()
             entry["finished_at"] = time.time()
 
     def _transfer_state(self, transfer: Transfer) -> str:

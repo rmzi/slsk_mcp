@@ -62,6 +62,11 @@ _MAX_CANDIDATES = int(os.environ.get("SLSK_MIRROR_MAX_CANDIDATES", "3"))
 _QUEUE_TIMEOUT_SEC = int(os.environ.get("SLSK_MIRROR_QUEUE_TIMEOUT", "300"))
 _STALL_TIMEOUT_SEC = int(os.environ.get("SLSK_MIRROR_STALL_TIMEOUT", "120"))
 _TRACK_POLL_SEC = 5
+# Search-outage handling: after this many consecutive zero-raw-result
+# searches (across all tracks in a job), force a Soulseek re-login.
+_OUTAGE_THRESHOLD = int(os.environ.get("SLSK_MIRROR_OUTAGE_THRESHOLD", "5"))
+_RELOGIN_COOLDOWN_SEC = 120
+_MAX_RELOGINS = int(os.environ.get("SLSK_MIRROR_MAX_RELOGINS", "5"))
 _SUPPORTED_FORMATS = ("flac", "mp3")
 DEFAULT_FORMATS = ("flac", "mp3")
 
@@ -272,8 +277,62 @@ def _search_kwargs(fmt: str) -> Dict[str, Any]:
     return kw
 
 
+class SearchHealth:
+    """Job-wide tracker for Soulseek search outages.
+
+    Observed behaviour: a session's searches sometimes start returning zero
+    results for everything and stay that way for many minutes, while a
+    fresh login works immediately. So after ``_OUTAGE_THRESHOLD`` consecutive
+    empty searches we force a re-login (rate-limited and capped).
+    """
+
+    def __init__(self) -> None:
+        self.consecutive_empty = 0
+        self.relogins = 0
+        self.last_relogin = 0.0
+        self.lock = asyncio.Lock()
+        self.ready = asyncio.Event()
+        self.ready.set()
+
+    def note_ok(self) -> None:
+        self.consecutive_empty = 0
+
+    async def note_empty(self, slsk: SoulseekWrapper) -> bool:
+        """Record an empty search. Returns True if a re-login was performed."""
+        self.consecutive_empty += 1
+        if self.consecutive_empty < _OUTAGE_THRESHOLD:
+            return False
+        async with self.lock:
+            # Re-check under the lock: another task may have just re-logged.
+            if self.consecutive_empty < _OUTAGE_THRESHOLD:
+                return False
+            if self.relogins >= _MAX_RELOGINS:
+                return False
+            if time.monotonic() - self.last_relogin < _RELOGIN_COOLDOWN_SEC:
+                return False
+            logger.warning(
+                "%d consecutive empty searches — forcing re-login (%d/%d)",
+                self.consecutive_empty, self.relogins + 1, _MAX_RELOGINS,
+            )
+            self.ready.clear()
+            try:
+                ok = await slsk.force_relogin()
+            except Exception:
+                logger.exception("force_relogin crashed")
+                ok = False
+            finally:
+                self.relogins += 1
+                self.last_relogin = time.monotonic()
+                self.consecutive_empty = 0
+                self.ready.set()
+            return ok
+
+
 async def _search_with_retry(
-    slsk: SoulseekWrapper, query: str, fmt: str
+    slsk: SoulseekWrapper,
+    query: str,
+    fmt: str,
+    health: Optional[SearchHealth] = None,
 ) -> List[SearchResultItem]:
     """Search, retrying with backoff only when Soulseek returns nothing at all.
 
@@ -284,9 +343,20 @@ async def _search_with_retry(
     """
     results: List[SearchResultItem] = []
     for attempt in range(_SEARCH_ATTEMPTS):
-        results, raw = await slsk.search_counted(query=query, **_search_kwargs(fmt))
+        if health is not None:
+            await health.ready.wait()  # don't search mid re-login
+        try:
+            results, raw = await slsk.search_counted(query=query, **_search_kwargs(fmt))
+        except Exception:
+            # e.g. the client was torn down by a concurrent re-login
+            logger.exception("Search errored for %r", query)
+            results, raw = [], 0
         if results or raw > 0:
+            if health is not None:
+                health.note_ok()
             return results
+        if health is not None and await health.note_empty(slsk):
+            continue  # fresh session: retry straight away
         if attempt < _SEARCH_ATTEMPTS - 1:
             delay = _SEARCH_BACKOFF_SEC[min(attempt, len(_SEARCH_BACKOFF_SEC) - 1)]
             logger.info(
@@ -353,6 +423,7 @@ async def _process_track(
     formats: Optional[List[str]] = None,
     search_sem: Optional[asyncio.Semaphore] = None,
     outcome: Optional[TrackOutcome] = None,
+    health: Optional[SearchHealth] = None,
 ) -> TrackOutcome:
     """Search for, download and verify one track. Mutates/returns ``outcome``.
 
@@ -384,7 +455,7 @@ async def _process_track(
         await search_sem.acquire()
     try:
         for fmt in formats:
-            results = await _search_with_retry(slsk, query, fmt)
+            results = await _search_with_retry(slsk, query, fmt, health)
             candidates = _rank_candidates(results, track, fmt)
             if candidates:
                 break
@@ -401,22 +472,27 @@ async def _process_track(
 
     attempts: List[str] = []
     for cand in candidates[:_MAX_CANDIDATES]:
-        ok, message, local_path, _filesize = await slsk.download(
-            cand.id, dest_dir=playlist_dir
-        )
-        if not ok:
-            attempts.append(f"{cand.username}: setup failed ({message})")
-            continue
-        outcome.status = "downloading"
-        outcome.download_id = cand.id
-        outcome.local_path = local_path
-        result = await _await_transfer(slsk, cand.id, local_path)
-        if result == "finished":
-            outcome.status, outcome.reason = "finished", None
-            return outcome
+        # One extra try on the same candidate if a re-login killed the transfer
+        # — that's our doing, not the peer's.
+        for _same in range(2):
+            ok, message, local_path, _filesize = await slsk.download(
+                cand.id, dest_dir=playlist_dir
+            )
+            if not ok:
+                result = f"setup failed ({message})"
+                break
+            outcome.status = "downloading"
+            outcome.download_id = cand.id
+            outcome.local_path = local_path
+            result = await _await_transfer(slsk, cand.id, local_path)
+            if result == "finished":
+                outcome.status, outcome.reason = "finished", None
+                return outcome
+            await _abandon(slsk, cand.id, local_path)
+            if result != "download session_expired":
+                break
         attempts.append(f"{cand.username}: {result}")
         logger.info("Candidate failed for %s - %s: %s", track.artist, track.title, result)
-        await _abandon(slsk, cand.id, local_path)
 
     outcome.status = "failed"
     outcome.download_id = None
@@ -456,6 +532,7 @@ async def _run_job(
         playlist_dir.mkdir(parents=True, exist_ok=True)
 
         sem = asyncio.Semaphore(_MAX_CONCURRENT_MATCH)
+        health = SearchHealth()
         # Pre-populate so playlist_job_status shows every track from the start.
         job.tracks = [
             TrackOutcome(artist=t.artist, title=t.title, isrc=t.isrc, status="queued")
@@ -465,7 +542,8 @@ async def _run_job(
         async def _one(track: TidalTrack, outcome: TrackOutcome) -> None:
             try:
                 await _process_track(
-                    track, slsk, playlist_dir, formats, search_sem=sem, outcome=outcome
+                    track, slsk, playlist_dir, formats,
+                    search_sem=sem, outcome=outcome, health=health,
                 )
             except Exception as exc:
                 logger.exception(

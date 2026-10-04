@@ -285,3 +285,86 @@ def test_existing_match_without_bracketed_suffix(tmp_path: Path):
     (tmp_path / "Breaka - Get Your Sweat On.mp3").write_bytes(b"x")
     t = TidalTrack(artist="Breaka", title="Get Your Sweat On (Original Mix)", album=None, duration_sec=None, isrc=None)
     assert mirror._already_downloaded(tmp_path, t, ["mp3"]) is not None
+
+
+# ── search outage → forced re-login ──────────────────────────────────────
+
+
+class OutageSlsk(FakeSlsk):
+    """Every search returns zero raw results until force_relogin is called."""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.relogins = 0
+
+    async def search_counted(self, query, extensions, **kw):
+        if self.relogins == 0:
+            self.searched.append(extensions[0])
+            return [], 0
+        return await super().search_counted(query, extensions, **kw)
+
+    async def force_relogin(self):
+        self.relogins += 1
+        return True
+
+
+def test_outage_triggers_relogin_and_recovers(monkeypatch):
+    monkeypatch.setattr(mirror, "_OUTAGE_THRESHOLD", 2)
+    monkeypatch.setattr(mirror, "_SEARCH_ATTEMPTS", 3)
+    slsk = OutageSlsk({"mp3": [[_item("m1", "mp3", 320)]]})
+    health = mirror.SearchHealth()
+
+    async def go():
+        # First track: 1 empty search, below threshold... then 2nd empty
+        # hits the threshold, re-login, immediate retry succeeds.
+        return await mirror._search_with_retry(slsk, "q", "mp3", health)
+
+    results = _run(go())
+    assert slsk.relogins == 1
+    assert [r.id for r in results] == ["m1"]
+    assert health.consecutive_empty == 0
+
+
+def test_relogin_respects_cooldown_and_cap(monkeypatch):
+    monkeypatch.setattr(mirror, "_OUTAGE_THRESHOLD", 1)
+    monkeypatch.setattr(mirror, "_MAX_RELOGINS", 1)
+
+    class NeverRecovers(OutageSlsk):
+        async def search_counted(self, query, extensions, **kw):
+            self.searched.append(extensions[0])
+            return [], 0
+
+    slsk = NeverRecovers({})
+    health = mirror.SearchHealth()
+
+    async def go():
+        for _ in range(4):
+            await mirror._search_with_retry(slsk, "q", "mp3", health)
+
+    _run(go())
+    assert slsk.relogins == 1  # capped
+
+
+def test_search_exception_treated_as_empty(tmp_path: Path):
+    class Boom(FakeSlsk):
+        calls = 0
+
+        async def search_counted(self, query, extensions, **kw):
+            Boom.calls += 1
+            if Boom.calls == 1:
+                raise AssertionError("client torn down")
+            return await super().search_counted(query, extensions, **kw)
+
+    slsk = Boom({"mp3": [[_item("m1", "mp3", 320)]]})
+    out = _run(mirror._process_track(_track(), slsk, tmp_path, ["mp3"]))
+    assert out.status == "finished"
+
+
+def test_session_expired_retries_same_candidate(tmp_path: Path):
+    # Re-login kills the transfer → retry the *same* peer once before
+    # moving to the next candidate.
+    slsk = FakeSlsk({"mp3": _three()}, behaviour={"a": [("session_expired", 0), ("finished", 10)]})
+    out = _run(mirror._process_track(_track(), slsk, tmp_path, ["mp3"]))
+    assert slsk.downloaded == ["a", "a"]
+    assert out.download_id == "a"
+    assert out.status == "finished"
