@@ -30,10 +30,10 @@ Downloads are written as `filename.flac.part` during transfer. The `.part` suffi
 Three tools work together:
 
 - `tidal_login_status()` — reports whether the cached OAuth token at `~/.config/slsk-mcp/tidal.json` is valid. If `logged_in=false`, tell the user to run the `slsk-mcp-tidal-login` CLI once on their host machine; the MCP subprocess can't prompt for OAuth interactively.
-- `mirror_tidal_playlist(url)` — accepts a Tidal playlist URL (e.g. `https://tidal.com/browse/playlist/<uuid>`) or bare UUID. Returns immediately with a `job_id` while the pipeline runs in the background. Downloads are written to a playlist-named subfolder of `SLSK_DOWNLOAD_DIR`.
+- `mirror_tidal_playlist(url, formats=None)` — accepts a Tidal playlist URL (e.g. `https://tidal.com/browse/playlist/<uuid>`) or bare UUID. Returns immediately with a `job_id` while the pipeline runs in the background. Downloads are written to a playlist-named subfolder of `SLSK_DOWNLOAD_DIR`.
 - `playlist_job_status(job_id)` — poll for progress. Each track has status `queued | downloading | finished | failed | skipped`. When the job completes, a `_failures.json` file is written under the playlist folder listing tracks that couldn't be matched.
 
-Quality policy (strict): FLAC (any bit depth/sample rate) preferred. Fallback is MP3 at exactly 320 kbps CBR — unknown bitrate and V0/V2 are rejected. Anything that can't meet this bar lands in the failures log rather than being silently accepted. Loosen via `_FILENAME_FUZZY_THRESHOLD` in `mirror.py` if too many real matches are being rejected.
+Quality policy (strict): FLAC (any bit depth/sample rate) preferred. Fallback is MP3 at exactly 320 kbps CBR — unknown bitrate and V0/V2 are rejected. Override with `formats` (ordered preference from `"flac"`, `"mp3"`): `["mp3"]` = 320 MP3 only, `["flac"]` = FLAC only. With `["mp3"]`, an existing FLAC in the playlist folder does not count as already downloaded. Anything that can't meet this bar lands in the failures log rather than being silently accepted. Loosen via `_FILENAME_FUZZY_THRESHOLD` in `mirror.py` if too many real matches are being rejected.
 
 Concurrency: up to `SLSK_MIRROR_CONCURRENCY` (default 3) per-track match phases run in parallel; the download phase is throttled by the existing `SLSK_MAX_CONCURRENT_DL`.
 

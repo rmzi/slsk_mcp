@@ -45,6 +45,30 @@ _FILENAME_FUZZY_THRESHOLD = 0.55
 _MAX_CONCURRENT_MATCH = int(os.environ.get("SLSK_MIRROR_CONCURRENCY", "3"))
 _POLL_INTERVAL_SEC = 15
 _MIN_FILESIZE = 1_000_000  # 1 MiB — reject obvious garbage
+_SUPPORTED_FORMATS = ("flac", "mp3")
+DEFAULT_FORMATS = ("flac", "mp3")
+
+
+def normalize_formats(formats: Optional[List[str]]) -> List[str]:
+    """Validate and de-duplicate a format preference list (order preserved).
+
+    ``None`` means the default policy (FLAC, then 320 MP3). Raises
+    ``ValueError`` on empty lists or unsupported formats.
+    """
+    if formats is None:
+        return list(DEFAULT_FORMATS)
+    out: List[str] = []
+    for f in formats:
+        norm = str(f).strip().lower().lstrip(".")
+        if norm not in _SUPPORTED_FORMATS:
+            raise ValueError(
+                f"Unsupported format {f!r}; allowed: {', '.join(_SUPPORTED_FORMATS)}"
+            )
+        if norm not in out:
+            out.append(norm)
+    if not out:
+        raise ValueError("formats must contain at least one of: flac, mp3")
+    return out
 
 # Featured-artist noise that shows up in Tidal titles but rarely in filenames.
 _FEAT_RE = re.compile(
@@ -177,8 +201,15 @@ def _pick_mp3_320(
     return best
 
 
-def _already_downloaded(playlist_dir: Path, track: TidalTrack) -> Optional[Path]:
-    """Return path to an existing file that looks like this track, else None."""
+def _already_downloaded(
+    playlist_dir: Path, track: TidalTrack, formats: Optional[List[str]] = None
+) -> Optional[Path]:
+    """Return path to an existing file that looks like this track, else None.
+
+    Only files whose extension is in ``formats`` count — an existing FLAC
+    does not satisfy an MP3-only mirror.
+    """
+    allowed = {f".{f}" for f in (formats or DEFAULT_FORMATS)}
     if not playlist_dir.exists():
         return None
     artist_low = _strip_feat(track.artist).lower()
@@ -186,7 +217,7 @@ def _already_downloaded(playlist_dir: Path, track: TidalTrack) -> Optional[Path]
     if not artist_low or not title_low:
         return None
     for p in playlist_dir.iterdir():
-        if p.is_file() and p.suffix.lower() in (".flac", ".mp3"):
+        if p.is_file() and p.suffix.lower() in allowed:
             stem_low = p.stem.lower()
             if artist_low in stem_low and title_low in stem_low:
                 return p
@@ -197,7 +228,9 @@ async def _process_track(
     track: TidalTrack,
     slsk: SoulseekWrapper,
     playlist_dir: Path,
+    formats: Optional[List[str]] = None,
 ) -> TrackOutcome:
+    formats = list(formats or DEFAULT_FORMATS)
     if not track.artist or not track.title:
         return TrackOutcome(
             artist=track.artist,
@@ -207,7 +240,7 @@ async def _process_track(
             reason="missing artist or title from Tidal",
         )
 
-    existing = _already_downloaded(playlist_dir, track)
+    existing = _already_downloaded(playlist_dir, track, formats)
     if existing is not None:
         return TrackOutcome(
             artist=track.artist,
@@ -220,33 +253,39 @@ async def _process_track(
 
     query = f"{_strip_feat(track.artist)} {_strip_feat(track.title)}".strip()
 
-    flac_results = await slsk.search(
-        query=query,
-        extensions=["flac"],
-        min_filesize=_MIN_FILESIZE,
-        free_slots_only=True,
-        max_queue_size=50,
-    )
-    pick = _pick_flac(flac_results, track)
+    pick: Optional[SearchResultItem] = None
+    for fmt in formats:
+        if fmt == "flac":
+            flac_results = await slsk.search(
+                query=query,
+                extensions=["flac"],
+                min_filesize=_MIN_FILESIZE,
+                free_slots_only=True,
+                max_queue_size=50,
+            )
+            pick = _pick_flac(flac_results, track)
+        elif fmt == "mp3":
+            mp3_results = await slsk.search(
+                query=query,
+                extensions=["mp3"],
+                min_bitrate=320,
+                min_filesize=_MIN_FILESIZE,
+                free_slots_only=True,
+                max_queue_size=50,
+            )
+            pick = _pick_mp3_320(mp3_results, track)
+        if pick is not None:
+            break
 
     if pick is None:
-        mp3_results = await slsk.search(
-            query=query,
-            extensions=["mp3"],
-            min_bitrate=320,
-            min_filesize=_MIN_FILESIZE,
-            free_slots_only=True,
-            max_queue_size=50,
-        )
-        pick = _pick_mp3_320(mp3_results, track)
-
-    if pick is None:
+        labels = {"flac": "FLAC", "mp3": "320 MP3"}
+        wanted = " or ".join(labels[f] for f in formats)
         return TrackOutcome(
             artist=track.artist,
             title=track.title,
             isrc=track.isrc,
             status="failed",
-            reason="no FLAC or 320 MP3 candidate passed filters",
+            reason=f"no {wanted} candidate passed filters",
         )
 
     ok, message, local_path, _filesize = await slsk.download(pick.id)
@@ -313,7 +352,10 @@ def _write_failures_log(playlist_dir: Path, outcomes: List[TrackOutcome]) -> Non
 
 
 async def _run_job(
-    job: JobState, tracks: List[TidalTrack], slsk: SoulseekWrapper
+    job: JobState,
+    tracks: List[TidalTrack],
+    slsk: SoulseekWrapper,
+    formats: Optional[List[str]] = None,
 ) -> None:
     try:
         playlist_dir = Path(job.playlist_dir)
@@ -324,7 +366,7 @@ async def _run_job(
         async def _one(track: TidalTrack) -> TrackOutcome:
             async with sem:
                 try:
-                    return await _process_track(track, slsk, playlist_dir)
+                    return await _process_track(track, slsk, playlist_dir, formats)
                 except Exception as exc:
                     logger.exception(
                         "Track processing crashed: %s - %s",
@@ -353,9 +395,17 @@ async def _run_job(
 
 
 async def start_mirror(
-    url: str, slsk: SoulseekWrapper, download_root: Path
+    url: str,
+    slsk: SoulseekWrapper,
+    download_root: Path,
+    formats: Optional[List[str]] = None,
 ) -> str:
-    """Kick off a playlist mirror job. Returns a short job_id."""
+    """Kick off a playlist mirror job. Returns a short job_id.
+
+    ``formats`` is an ordered preference list drawn from {"flac", "mp3"};
+    default is FLAC then 320 MP3. Pass ["mp3"] for MP3-only.
+    """
+    formats = normalize_formats(formats)
     session = load_session()
     if session is None:
         raise RuntimeError(
@@ -378,7 +428,7 @@ async def start_mirror(
     )
     _JOBS[job_id] = job
 
-    asyncio.create_task(_run_job(job, tracks, slsk))
+    asyncio.create_task(_run_job(job, tracks, slsk, formats))
     return job_id
 
 
