@@ -37,6 +37,12 @@ Quality policy (strict): FLAC (any bit depth/sample rate) preferred. Fallback is
 
 Concurrency: up to `SLSK_MIRROR_CONCURRENCY` (default 3) per-track match phases run in parallel; the download phase is throttled by the existing `SLSK_MAX_CONCURRENT_DL`.
 
+Retries and fallback (all env-tunable):
+- Empty searches are retried (`SLSK_MIRROR_SEARCH_ATTEMPTS`, default 3; waits 30s then 120s). Soulseek has transient search outages lasting minutes where every query returns nothing.
+- Each track keeps a ranked candidate list. A download that fails, receives no bytes for `SLSK_MIRROR_QUEUE_TIMEOUT` (300s), or stalls for `SLSK_MIRROR_STALL_TIMEOUT` (120s) is cancelled (its `.part` removed) and the next candidate is tried, up to `SLSK_MIRROR_MAX_CANDIDATES` (3).
+- Downloads are written into the playlist folder itself, and each track task watches its own transfer from the start, so the client's 60s finished-record TTL can't cause false `not_found` failures.
+- "Already downloaded" = a file in the playlist folder whose name contains the normalised track title (with or without bracketed suffixes). Re-running a playlist only fetches what's missing.
+
 ### One-time Tidal OAuth bootstrap
 
 Run once on the host machine (not from inside Claude Desktop):

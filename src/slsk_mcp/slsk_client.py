@@ -430,11 +430,11 @@ class SoulseekWrapper:
     # ── Download ─────────────────────────────────────────────────────────
 
     async def download(
-        self, file_id: str
+        self, file_id: str, dest_dir: Optional[Path] = None
     ) -> Tuple[bool, str, Optional[str], Optional[int]]:
         """Start a download. Returns (success, message, local_path, filesize).
 
-        Files are saved to SLSK_DOWNLOAD_DIR (set at login time).
+        Files are saved to ``dest_dir`` if given, else SLSK_DOWNLOAD_DIR.
         During transfer the file has a .part suffix; it is renamed to the
         final name only on successful completion.
         """
@@ -479,7 +479,7 @@ class SoulseekWrapper:
             # Build the final path and set .part path on the transfer so
             # aioslsk writes to the .part file directly.
             filename = remote_path.rsplit("\\", 1)[-1].rsplit("/", 1)[-1]
-            dl_dir = get_download_dir()
+            dl_dir = Path(dest_dir) if dest_dir is not None else get_download_dir()
             dl_dir.mkdir(parents=True, exist_ok=True)
             final_path = dl_dir / filename
             # Resolve collision on the final name
