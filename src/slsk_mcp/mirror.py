@@ -275,16 +275,17 @@ def _search_kwargs(fmt: str) -> Dict[str, Any]:
 async def _search_with_retry(
     slsk: SoulseekWrapper, query: str, fmt: str
 ) -> List[SearchResultItem]:
-    """Search, retrying with backoff when Soulseek returns nothing.
+    """Search, retrying with backoff only when Soulseek returns nothing at all.
 
-    An empty result is ambiguous — the file may not exist, or the network
-    may be briefly throttling/dropping search responses. Retrying a couple
-    of times is cheap compared with permanently failing a track.
+    Zero raw results is ambiguous — the file may not exist, or the network
+    may be briefly dropping search responses — so it's worth retrying.
+    If results came back but none passed the filters, a retry returns the
+    same thing and just wastes time, so we stop.
     """
     results: List[SearchResultItem] = []
     for attempt in range(_SEARCH_ATTEMPTS):
-        results = await slsk.search(query=query, **_search_kwargs(fmt))
-        if results:
+        results, raw = await slsk.search_counted(query=query, **_search_kwargs(fmt))
+        if results or raw > 0:
             return results
         if attempt < _SEARCH_ATTEMPTS - 1:
             delay = _SEARCH_BACKOFF_SEC[min(attempt, len(_SEARCH_BACKOFF_SEC) - 1)]

@@ -338,7 +338,12 @@ class SoulseekWrapper:
 
     # ── Search ───────────────────────────────────────────────────────────
 
-    async def search(
+    async def search(self, query: str, **kwargs: Any) -> List[SearchResultItem]:
+        """Run a network search and return sorted, filtered results."""
+        items, _raw = await self.search_counted(query, **kwargs)
+        return items
+
+    async def search_counted(
         self,
         query: str,
         timeout: Optional[int] = None,
@@ -350,8 +355,12 @@ class SoulseekWrapper:
         free_slots_only: bool = False,
         max_queue_size: Optional[int] = None,
         min_speed: Optional[int] = None,
-    ) -> List[SearchResultItem]:
-        """Run a network search and return sorted, filtered results."""
+    ) -> Tuple[List[SearchResultItem], int]:
+        """Like ``search`` but also returns the raw (pre-filter) result count.
+
+        A raw count of 0 means the network returned nothing at all, which is
+        distinguishable from "results existed but none passed the filters".
+        """
         assert self._client is not None
 
         if timeout is None:
@@ -425,7 +434,7 @@ class SoulseekWrapper:
             reverse=True,
         )
 
-        return items[:max_results]
+        return items[:max_results], len(request.results)
 
     # ── Download ─────────────────────────────────────────────────────────
 

@@ -55,12 +55,17 @@ class FakeSlsk:
         self.dest_dirs: List[Path] = []
         self._polls: Dict[str, int] = {}
 
-    async def search(self, query, extensions, **kw):
+    async def search_counted(self, query, extensions, **kw):
+        """Results are pre-filter here; mimic the client's 320 filter so the
+        raw count can be non-zero while the filtered list is empty."""
         ext = extensions[0]
         n = sum(1 for e in self.searched if e == ext)
         self.searched.append(ext)
         seq = self.results_by_ext.get(ext, [[]])
-        return seq[min(n, len(seq) - 1)]
+        raw = seq[min(n, len(seq) - 1)]
+        min_br = kw.get("min_bitrate")
+        kept = [r for r in raw if not min_br or (r.bitrate or 0) >= min_br]
+        return kept, len(raw)
 
     async def download(self, item_id, dest_dir=None):
         self.downloaded.append(item_id)
@@ -151,6 +156,15 @@ def test_nonempty_search_not_retried(tmp_path: Path):
     # Results exist but none pass the 320 filter: no point re-searching.
     slsk = FakeSlsk({"mp3": [[_item("m1", "mp3", 192)]]})
     _run(mirror._process_track(_track(), slsk, tmp_path, ["mp3"]))
+    assert slsk.searched == ["mp3"]
+
+
+def test_raw_results_filtered_to_nothing_not_retried(tmp_path: Path):
+    # Regression: retries used to fire whenever the *filtered* list was
+    # empty, re-running identical searches for 2.5 minutes per track.
+    slsk = FakeSlsk({"mp3": [[_item("m1", "mp3", 128), _item("m2", "mp3", 192)]]})
+    out = _run(mirror._process_track(_track(), slsk, tmp_path, ["mp3"]))
+    assert out.status == "failed"
     assert slsk.searched == ["mp3"]
 
 
