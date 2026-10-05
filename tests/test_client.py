@@ -152,3 +152,43 @@ def test_default_max_filesize_is_reasonable():
     # enough for full-album FLAC sets but cheap enough that a malicious peer can't
     # fill a typical disk in one download.
     assert 1 * 1024**3 <= _DEFAULT_MAX_FILESIZE_BYTES <= 100 * 1024**3
+
+
+def test_get_download_dir_expands_tilde(monkeypatch):
+    import os
+    from slsk_mcp.slsk_client import get_download_dir
+
+    monkeypatch.setenv("SLSK_DOWNLOAD_DIR", "~/Music/slsk")
+    assert str(get_download_dir()) == os.path.expanduser("~/Music/slsk")
+    assert "~" not in str(get_download_dir())
+
+
+def test_watch_transfer_exits_on_relogin_and_releases_own_semaphore():
+    """After a forced re-login, watchers of old-session transfers must stop
+    and release the semaphore they acquired — not the new session's."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from slsk_mcp.slsk_client import SoulseekWrapper
+
+    async def go():
+        w = SoulseekWrapper()
+        old_sem = asyncio.Semaphore(2)
+        await old_sem.acquire()
+        new_sem = asyncio.Semaphore(2)
+        w._download_sem = new_sem
+        stuck = SimpleNamespace(state=SimpleNamespace(VALUE=SimpleNamespace(name="QUEUED")))
+        w._session_id = 1
+        w._downloads["u:\\f.mp3"] = {
+            "transfer": stuck, "local_path": "/nope/f.mp3", "part_path": "/nope/f.mp3.part",
+            "session_id": 1, "sem": old_sem, "finished_at": None,
+        }
+        task = asyncio.create_task(w._watch_transfer("u:\\f.mp3"))
+        await asyncio.sleep(0.05)
+        assert not task.done()
+        w._session_id = 2  # simulate force_relogin
+        await asyncio.wait_for(task, timeout=3)
+        assert old_sem._value == 2  # released back
+        assert new_sem._value == 2  # untouched
+
+    asyncio.run(go())

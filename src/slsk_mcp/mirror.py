@@ -2,9 +2,19 @@
 
 Takes a Tidal playlist URL, enumerates tracks, searches Soulseek for each,
 picks the best candidate matching a strict quality policy (FLAC, falling
-back to 320 CBR MP3), queues downloads through the existing
-``SoulseekWrapper``, polls to completion, and writes a failures log to the
-playlist directory.
+back to 320 CBR MP3; overridable via ``formats``), downloads into the
+playlist directory through the existing ``SoulseekWrapper``, and writes a
+failures log there.
+
+Resilience:
+- Empty searches are retried with backoff (``SLSK_MIRROR_SEARCH_ATTEMPTS``),
+  since Soulseek sometimes returns nothing transiently.
+- Each track keeps a ranked list of candidates. If a download fails, sits
+  in a remote queue with no bytes for ``SLSK_MIRROR_QUEUE_TIMEOUT`` seconds,
+  or stalls for ``SLSK_MIRROR_STALL_TIMEOUT`` seconds, it is cancelled and
+  the next candidate (up to ``SLSK_MIRROR_MAX_CANDIDATES``) is tried.
+- Each download is watched by its own track task from the moment it
+  starts, so finished records can't be purged before they're observed.
 
 Design notes:
 - Jobs are tracked in an in-memory dict keyed by a short random id. On MCP
@@ -43,8 +53,44 @@ logger = logging.getLogger("slsk_mcp.mirror")
 _DURATION_TOLERANCE_SEC = 5
 _FILENAME_FUZZY_THRESHOLD = 0.55
 _MAX_CONCURRENT_MATCH = int(os.environ.get("SLSK_MIRROR_CONCURRENCY", "3"))
-_POLL_INTERVAL_SEC = 15
 _MIN_FILESIZE = 1_000_000  # 1 MiB — reject obvious garbage
+_SEARCH_ATTEMPTS = int(os.environ.get("SLSK_MIRROR_SEARCH_ATTEMPTS", "3"))
+# Wait before the 2nd, 3rd... search attempt. Observed Soulseek search
+# outages last minutes, not seconds, so the second wait is long.
+_SEARCH_BACKOFF_SEC = (30, 120)
+_MAX_CANDIDATES = int(os.environ.get("SLSK_MIRROR_MAX_CANDIDATES", "3"))
+_QUEUE_TIMEOUT_SEC = int(os.environ.get("SLSK_MIRROR_QUEUE_TIMEOUT", "300"))
+_STALL_TIMEOUT_SEC = int(os.environ.get("SLSK_MIRROR_STALL_TIMEOUT", "120"))
+_TRACK_POLL_SEC = 5
+# Search-outage handling: after this many consecutive zero-raw-result
+# searches (across all tracks in a job), force a Soulseek re-login.
+_OUTAGE_THRESHOLD = int(os.environ.get("SLSK_MIRROR_OUTAGE_THRESHOLD", "5"))
+_RELOGIN_COOLDOWN_SEC = 120
+_MAX_RELOGINS = int(os.environ.get("SLSK_MIRROR_MAX_RELOGINS", "5"))
+_SUPPORTED_FORMATS = ("flac", "mp3")
+DEFAULT_FORMATS = ("flac", "mp3")
+
+
+def normalize_formats(formats: Optional[List[str]]) -> List[str]:
+    """Validate and de-duplicate a format preference list (order preserved).
+
+    ``None`` means the default policy (FLAC, then 320 MP3). Raises
+    ``ValueError`` on empty lists or unsupported formats.
+    """
+    if formats is None:
+        return list(DEFAULT_FORMATS)
+    out: List[str] = []
+    for f in formats:
+        norm = str(f).strip().lower().lstrip(".")
+        if norm not in _SUPPORTED_FORMATS:
+            raise ValueError(
+                f"Unsupported format {f!r}; allowed: {', '.join(_SUPPORTED_FORMATS)}"
+            )
+        if norm not in out:
+            out.append(norm)
+    if not out:
+        raise ValueError("formats must contain at least one of: flac, mp3")
+    return out
 
 # Featured-artist noise that shows up in Tidal titles but rarely in filenames.
 _FEAT_RE = re.compile(
@@ -60,7 +106,7 @@ class TrackOutcome:
     artist: str
     title: str
     isrc: Optional[str]
-    status: str  # queued | downloading | finished | failed | skipped
+    status: str  # queued (waiting) | downloading | finished | failed | skipped
     reason: Optional[str] = None
     download_id: Optional[str] = None
     local_path: Optional[str] = None
@@ -87,7 +133,9 @@ class JobState:
             "playlist_dir": self.playlist_dir,
             "status": self.status,
             "total_tracks": self.total_tracks,
-            "processed": len(self.tracks),
+            "processed": sum(
+                1 for t in self.tracks if t.status in ("finished", "failed", "skipped")
+            ),
             "counts": counts,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
@@ -142,154 +190,315 @@ def _score_candidate(
     return ratio
 
 
-def _pick_flac(
-    candidates: List[SearchResultItem], track: TidalTrack
-) -> Optional[SearchResultItem]:
-    best: Optional[SearchResultItem] = None
-    best_score = -1.0
+def _rank_candidates(
+    candidates: List[SearchResultItem], track: TidalTrack, fmt: str
+) -> List[SearchResultItem]:
+    """Return candidates of ``fmt`` that pass the quality policy, best first.
+
+    MP3 must be exactly 320 kbps (unknown bitrate and VBR rejected).
+    Duplicate ids are collapsed.
+    """
+    scored: List[tuple] = []
+    seen: set = set()
     for c in candidates:
-        if c.extension != "flac":
+        if c.extension != fmt or c.id in seen:
+            continue
+        # Strict: exact 320. Unknown bitrate rejected (per user spec).
+        if fmt == "mp3" and c.bitrate != 320:
             continue
         score = _score_candidate(c, track)
         if score is None:
             continue
-        if score > best_score:
-            best, best_score = c, score
-    return best
+        seen.add(c.id)
+        scored.append((score, c))
+    scored.sort(key=lambda sc: sc[0], reverse=True)
+    return [c for _, c in scored]
+
+
+def _pick_flac(
+    candidates: List[SearchResultItem], track: TidalTrack
+) -> Optional[SearchResultItem]:
+    ranked = _rank_candidates(candidates, track, "flac")
+    return ranked[0] if ranked else None
 
 
 def _pick_mp3_320(
     candidates: List[SearchResultItem], track: TidalTrack
 ) -> Optional[SearchResultItem]:
-    best: Optional[SearchResultItem] = None
-    best_score = -1.0
-    for c in candidates:
-        if c.extension != "mp3":
-            continue
-        # Strict: exact 320. Unknown bitrate rejected (per user spec).
-        if c.bitrate != 320:
-            continue
-        score = _score_candidate(c, track)
-        if score is None:
-            continue
-        if score > best_score:
-            best, best_score = c, score
-    return best
+    ranked = _rank_candidates(candidates, track, "mp3")
+    return ranked[0] if ranked else None
 
 
-def _already_downloaded(playlist_dir: Path, track: TidalTrack) -> Optional[Path]:
-    """Return path to an existing file that looks like this track, else None."""
+_NON_ALNUM = re.compile(r"[^a-z0-9]+")
+_BRACKETED = re.compile(r"\s*[\(\[][^)\]]*[\)\]]")
+
+
+def _norm(text: str) -> str:
+    """Lowercase and drop everything but letters/digits, for loose matching."""
+    return _NON_ALNUM.sub("", text.lower())
+
+
+def _already_downloaded(
+    playlist_dir: Path, track: TidalTrack, formats: Optional[List[str]] = None
+) -> Optional[Path]:
+    """Return path to an existing file that looks like this track, else None.
+
+    Only files whose extension is in ``formats`` count — an existing FLAC
+    does not satisfy an MP3-only mirror. Matching is on the normalised
+    title alone (filenames often omit the artist, e.g. "03 Skkrtt.mp3");
+    the search is scoped to this playlist's folder, so collisions are rare.
+    """
+    allowed = {f".{f}" for f in (formats or DEFAULT_FORMATS)}
     if not playlist_dir.exists():
         return None
-    artist_low = _strip_feat(track.artist).lower()
-    title_low = _strip_feat(track.title).lower()
-    if not artist_low or not title_low:
+    base = _strip_feat(track.title)
+    # Also accept the title without bracketed suffixes, e.g. "(Original Mix)".
+    variants = {_norm(base), _norm(_BRACKETED.sub("", base))}
+    variants = {v for v in variants if len(v) >= 3}
+    if not variants:
         return None
     for p in playlist_dir.iterdir():
-        if p.is_file() and p.suffix.lower() in (".flac", ".mp3"):
-            stem_low = p.stem.lower()
-            if artist_low in stem_low and title_low in stem_low:
+        if p.is_file() and p.suffix.lower() in allowed:
+            stem_n = _norm(p.stem)
+            if any(v in stem_n for v in variants):
                 return p
     return None
+
+
+def _search_kwargs(fmt: str) -> Dict[str, Any]:
+    kw: Dict[str, Any] = dict(
+        extensions=[fmt],
+        min_filesize=_MIN_FILESIZE,
+        free_slots_only=True,
+        max_queue_size=50,
+    )
+    if fmt == "mp3":
+        kw["min_bitrate"] = 320
+    return kw
+
+
+class SearchHealth:
+    """Job-wide tracker for Soulseek search outages.
+
+    Observed behaviour: a session's searches sometimes start returning zero
+    results for everything and stay that way for many minutes, while a
+    fresh login works immediately. So after ``_OUTAGE_THRESHOLD`` consecutive
+    empty searches we force a re-login (rate-limited and capped).
+    """
+
+    def __init__(self) -> None:
+        self.consecutive_empty = 0
+        self.relogins = 0
+        self.last_relogin = 0.0
+        self.lock = asyncio.Lock()
+        self.ready = asyncio.Event()
+        self.ready.set()
+
+    def note_ok(self) -> None:
+        self.consecutive_empty = 0
+
+    async def note_empty(self, slsk: SoulseekWrapper) -> bool:
+        """Record an empty search. Returns True if a re-login was performed."""
+        self.consecutive_empty += 1
+        if self.consecutive_empty < _OUTAGE_THRESHOLD:
+            return False
+        async with self.lock:
+            # Re-check under the lock: another task may have just re-logged.
+            if self.consecutive_empty < _OUTAGE_THRESHOLD:
+                return False
+            if self.relogins >= _MAX_RELOGINS:
+                return False
+            if time.monotonic() - self.last_relogin < _RELOGIN_COOLDOWN_SEC:
+                return False
+            logger.warning(
+                "%d consecutive empty searches — forcing re-login (%d/%d)",
+                self.consecutive_empty, self.relogins + 1, _MAX_RELOGINS,
+            )
+            self.ready.clear()
+            try:
+                ok = await slsk.force_relogin()
+            except Exception:
+                logger.exception("force_relogin crashed")
+                ok = False
+            finally:
+                self.relogins += 1
+                self.last_relogin = time.monotonic()
+                self.consecutive_empty = 0
+                self.ready.set()
+            return ok
+
+
+async def _search_with_retry(
+    slsk: SoulseekWrapper,
+    query: str,
+    fmt: str,
+    health: Optional[SearchHealth] = None,
+) -> List[SearchResultItem]:
+    """Search, retrying with backoff only when Soulseek returns nothing at all.
+
+    Zero raw results is ambiguous — the file may not exist, or the network
+    may be briefly dropping search responses — so it's worth retrying.
+    If results came back but none passed the filters, a retry returns the
+    same thing and just wastes time, so we stop.
+    """
+    results: List[SearchResultItem] = []
+    for attempt in range(_SEARCH_ATTEMPTS):
+        if health is not None:
+            await health.ready.wait()  # don't search mid re-login
+        try:
+            results, raw = await slsk.search_counted(query=query, **_search_kwargs(fmt))
+        except Exception:
+            # e.g. the client was torn down by a concurrent re-login
+            logger.exception("Search errored for %r", query)
+            results, raw = [], 0
+        if results or raw > 0:
+            if health is not None:
+                health.note_ok()
+            return results
+        if health is not None and await health.note_empty(slsk):
+            continue  # fresh session: retry straight away
+        if attempt < _SEARCH_ATTEMPTS - 1:
+            delay = _SEARCH_BACKOFF_SEC[min(attempt, len(_SEARCH_BACKOFF_SEC) - 1)]
+            logger.info(
+                "Empty search for %r (%s), retry %d/%d in %ss",
+                query, fmt, attempt + 1, _SEARCH_ATTEMPTS - 1, delay,
+            )
+            await asyncio.sleep(delay)
+    return results
+
+
+async def _await_transfer(
+    slsk: SoulseekWrapper, file_id: str, local_path: Optional[str]
+) -> str:
+    """Watch one transfer. Returns "finished" or a short failure reason.
+
+    Gives up with "queued too long" if no bytes arrive within
+    ``_QUEUE_TIMEOUT_SEC`` and "stalled" if bytes stop moving for
+    ``_STALL_TIMEOUT_SEC``. A purged/unknown record is resolved by checking
+    whether the final file exists on disk.
+    """
+    start = time.monotonic()
+    last_bytes = 0
+    last_progress = start
+    while True:
+        await asyncio.sleep(_TRACK_POLL_SEC)
+        ds = slsk.download_status(file_id)
+        if ds.status == "finished":
+            return "finished"
+        if ds.status in ("not_found", "session_expired"):
+            if local_path and Path(local_path).exists():
+                return "finished"
+            return f"download {ds.status}"
+        if ds.status in ("failed", "cancelled"):
+            return f"download {ds.status}"
+        now = time.monotonic()
+        received = ds.received_bytes or 0
+        if received > last_bytes:
+            last_bytes, last_progress = received, now
+        if last_bytes == 0 and now - start > _QUEUE_TIMEOUT_SEC:
+            return "queued too long"
+        if last_bytes > 0 and now - last_progress > _STALL_TIMEOUT_SEC:
+            return "stalled"
+
+
+async def _abandon(slsk: SoulseekWrapper, file_id: str, local_path: Optional[str]) -> None:
+    """Cancel a dead transfer and remove its partial file."""
+    try:
+        await slsk.cancel_download(file_id)
+    except Exception:
+        logger.exception("cancel_download failed for %s", file_id)
+    if local_path:
+        part = Path(local_path + ".part")
+        try:
+            if part.exists():
+                part.unlink()
+        except OSError:
+            pass
 
 
 async def _process_track(
     track: TidalTrack,
     slsk: SoulseekWrapper,
     playlist_dir: Path,
+    formats: Optional[List[str]] = None,
+    search_sem: Optional[asyncio.Semaphore] = None,
+    outcome: Optional[TrackOutcome] = None,
+    health: Optional[SearchHealth] = None,
 ) -> TrackOutcome:
-    if not track.artist or not track.title:
-        return TrackOutcome(
-            artist=track.artist,
-            title=track.title,
-            isrc=track.isrc,
-            status="failed",
-            reason="missing artist or title from Tidal",
+    """Search for, download and verify one track. Mutates/returns ``outcome``.
+
+    The search phase runs under ``search_sem`` (if given) so only a few
+    tracks hit the network search at once; the download phase is throttled
+    by ``SoulseekWrapper``'s own download semaphore.
+    """
+    formats = list(formats or DEFAULT_FORMATS)
+    if outcome is None:
+        outcome = TrackOutcome(
+            artist=track.artist, title=track.title, isrc=track.isrc, status="queued"
         )
 
-    existing = _already_downloaded(playlist_dir, track)
+    if not track.artist or not track.title:
+        outcome.status, outcome.reason = "failed", "missing artist or title from Tidal"
+        return outcome
+
+    existing = _already_downloaded(playlist_dir, track, formats)
     if existing is not None:
-        return TrackOutcome(
-            artist=track.artist,
-            title=track.title,
-            isrc=track.isrc,
-            status="skipped",
-            reason="already present in playlist dir",
-            local_path=str(existing),
-        )
+        outcome.status = "skipped"
+        outcome.reason = "already present in playlist dir"
+        outcome.local_path = str(existing)
+        return outcome
 
     query = f"{_strip_feat(track.artist)} {_strip_feat(track.title)}".strip()
 
-    flac_results = await slsk.search(
-        query=query,
-        extensions=["flac"],
-        min_filesize=_MIN_FILESIZE,
-        free_slots_only=True,
-        max_queue_size=50,
-    )
-    pick = _pick_flac(flac_results, track)
+    candidates: List[SearchResultItem] = []
+    if search_sem is not None:
+        await search_sem.acquire()
+    try:
+        for fmt in formats:
+            results = await _search_with_retry(slsk, query, fmt, health)
+            candidates = _rank_candidates(results, track, fmt)
+            if candidates:
+                break
+    finally:
+        if search_sem is not None:
+            search_sem.release()
 
-    if pick is None:
-        mp3_results = await slsk.search(
-            query=query,
-            extensions=["mp3"],
-            min_bitrate=320,
-            min_filesize=_MIN_FILESIZE,
-            free_slots_only=True,
-            max_queue_size=50,
-        )
-        pick = _pick_mp3_320(mp3_results, track)
+    if not candidates:
+        labels = {"flac": "FLAC", "mp3": "320 MP3"}
+        wanted = " or ".join(labels[f] for f in formats)
+        outcome.status = "failed"
+        outcome.reason = f"no {wanted} candidate passed filters"
+        return outcome
 
-    if pick is None:
-        return TrackOutcome(
-            artist=track.artist,
-            title=track.title,
-            isrc=track.isrc,
-            status="failed",
-            reason="no FLAC or 320 MP3 candidate passed filters",
-        )
+    attempts: List[str] = []
+    for cand in candidates[:_MAX_CANDIDATES]:
+        # One extra try on the same candidate if a re-login killed the transfer
+        # — that's our doing, not the peer's.
+        for _same in range(2):
+            ok, message, local_path, _filesize = await slsk.download(
+                cand.id, dest_dir=playlist_dir
+            )
+            if not ok:
+                result = f"setup failed ({message})"
+                break
+            outcome.status = "downloading"
+            outcome.download_id = cand.id
+            outcome.local_path = local_path
+            result = await _await_transfer(slsk, cand.id, local_path)
+            if result == "finished":
+                outcome.status, outcome.reason = "finished", None
+                return outcome
+            await _abandon(slsk, cand.id, local_path)
+            if result != "download session_expired":
+                break
+        attempts.append(f"{cand.username}: {result}")
+        logger.info("Candidate failed for %s - %s: %s", track.artist, track.title, result)
 
-    ok, message, local_path, _filesize = await slsk.download(pick.id)
-    if not ok:
-        return TrackOutcome(
-            artist=track.artist,
-            title=track.title,
-            isrc=track.isrc,
-            status="failed",
-            reason=f"download setup failed: {message}",
-        )
-
-    return TrackOutcome(
-        artist=track.artist,
-        title=track.title,
-        isrc=track.isrc,
-        status="queued",
-        download_id=pick.id,
-        local_path=local_path,
-    )
-
-
-async def _wait_for_downloads(
-    outcomes: List[TrackOutcome], slsk: SoulseekWrapper
-) -> None:
-    """Poll every queued download until it resolves to finished or failed."""
-    pending = [o for o in outcomes if o.status == "queued" and o.download_id]
-    while pending:
-        await asyncio.sleep(_POLL_INTERVAL_SEC)
-        still_pending: List[TrackOutcome] = []
-        for o in pending:
-            assert o.download_id is not None
-            ds = slsk.download_status(o.download_id)
-            if ds.status == "finished":
-                o.status = "finished"
-                o.local_path = ds.local_path
-            elif ds.status in ("failed", "cancelled", "not_found", "session_expired"):
-                o.status = "failed"
-                o.reason = f"download {ds.status}"
-            else:
-                o.status = "downloading"
-                still_pending.append(o)
-        pending = still_pending
+    outcome.status = "failed"
+    outcome.download_id = None
+    outcome.local_path = None
+    outcome.reason = f"all {len(attempts)} candidate(s) failed: " + "; ".join(attempts)
+    return outcome
 
 
 def _write_failures_log(playlist_dir: Path, outcomes: List[TrackOutcome]) -> None:
@@ -313,36 +522,38 @@ def _write_failures_log(playlist_dir: Path, outcomes: List[TrackOutcome]) -> Non
 
 
 async def _run_job(
-    job: JobState, tracks: List[TidalTrack], slsk: SoulseekWrapper
+    job: JobState,
+    tracks: List[TidalTrack],
+    slsk: SoulseekWrapper,
+    formats: Optional[List[str]] = None,
 ) -> None:
     try:
         playlist_dir = Path(job.playlist_dir)
         playlist_dir.mkdir(parents=True, exist_ok=True)
 
         sem = asyncio.Semaphore(_MAX_CONCURRENT_MATCH)
+        health = SearchHealth()
+        # Pre-populate so playlist_job_status shows every track from the start.
+        job.tracks = [
+            TrackOutcome(artist=t.artist, title=t.title, isrc=t.isrc, status="queued")
+            for t in tracks
+        ]
 
-        async def _one(track: TidalTrack) -> TrackOutcome:
-            async with sem:
-                try:
-                    return await _process_track(track, slsk, playlist_dir)
-                except Exception as exc:
-                    logger.exception(
-                        "Track processing crashed: %s - %s",
-                        track.artist, track.title,
-                    )
-                    return TrackOutcome(
-                        artist=track.artist,
-                        title=track.title,
-                        isrc=track.isrc,
-                        status="failed",
-                        reason=f"crash: {type(exc).__name__}",
-                    )
+        async def _one(track: TidalTrack, outcome: TrackOutcome) -> None:
+            try:
+                await _process_track(
+                    track, slsk, playlist_dir, formats,
+                    search_sem=sem, outcome=outcome, health=health,
+                )
+            except Exception as exc:
+                logger.exception(
+                    "Track processing crashed: %s - %s", track.artist, track.title
+                )
+                outcome.status = "failed"
+                outcome.reason = f"crash: {type(exc).__name__}"
 
-        outcomes = await asyncio.gather(*(_one(t) for t in tracks))
-        job.tracks = outcomes
-
-        await _wait_for_downloads(outcomes, slsk)
-        _write_failures_log(playlist_dir, outcomes)
+        await asyncio.gather(*(_one(t, o) for t, o in zip(tracks, job.tracks)))
+        _write_failures_log(playlist_dir, job.tracks)
 
         job.status = "complete"
     except Exception:
@@ -353,9 +564,17 @@ async def _run_job(
 
 
 async def start_mirror(
-    url: str, slsk: SoulseekWrapper, download_root: Path
+    url: str,
+    slsk: SoulseekWrapper,
+    download_root: Path,
+    formats: Optional[List[str]] = None,
 ) -> str:
-    """Kick off a playlist mirror job. Returns a short job_id."""
+    """Kick off a playlist mirror job. Returns a short job_id.
+
+    ``formats`` is an ordered preference list drawn from {"flac", "mp3"};
+    default is FLAC then 320 MP3. Pass ["mp3"] for MP3-only.
+    """
+    formats = normalize_formats(formats)
     session = load_session()
     if session is None:
         raise RuntimeError(
@@ -378,7 +597,7 @@ async def start_mirror(
     )
     _JOBS[job_id] = job
 
-    asyncio.create_task(_run_job(job, tracks, slsk))
+    asyncio.create_task(_run_job(job, tracks, slsk, formats))
     return job_id
 
 

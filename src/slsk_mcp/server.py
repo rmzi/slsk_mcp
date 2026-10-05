@@ -8,7 +8,7 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from mcp.server.fastmcp import FastMCP
 
@@ -22,7 +22,7 @@ from .models import (
     CancelDownloadResponse,
     PeerStatusResponse,
 )
-from .slsk_client import SoulseekWrapper
+from .slsk_client import SoulseekWrapper, get_download_dir
 
 logger = logging.getLogger("slsk_mcp")
 logging.basicConfig(level=logging.INFO, stream=sys.stderr)
@@ -269,7 +269,7 @@ async def get_config() -> dict:
     """
     return {
         "username": os.environ.get("SLSK_USERNAME", ""),
-        "download_dir": os.environ.get("SLSK_DOWNLOAD_DIR", "./downloads"),
+        "download_dir": str(get_download_dir()),
         "listen_port": os.environ.get("SLSK_LISTEN_PORT", "(default 60000)"),
         "obfuscated_port": os.environ.get("SLSK_OBFUSCATED_PORT", "(default 60001)"),
         "max_concurrent_downloads": int(os.environ.get("SLSK_MAX_CONCURRENT_DL", "2")),
@@ -322,11 +322,17 @@ async def tidal_login_status() -> dict:
 
 
 @mcp.tool()
-async def mirror_tidal_playlist(url: str) -> dict:
+async def mirror_tidal_playlist(
+    url: str, formats: Optional[List[str]] = None
+) -> dict:
     """Mirror a Tidal playlist to Soulseek.
 
     For each track: search Soulseek, prefer FLAC, fall back to 320 CBR MP3,
-    otherwise record the track in the failures log. Downloads are written
+    otherwise record the track in the failures log.
+
+    `formats` overrides the format policy as an ordered preference list
+    drawn from "flac" and "mp3". E.g. ["mp3"] = MP3 (320 CBR) only;
+    ["flac"] = FLAC only. Omit for the default (FLAC, then MP3). Downloads are written
     to a subfolder of SLSK_DOWNLOAD_DIR named after the playlist; a
     `_failures.json` file summarises anything that couldn't be matched.
 
@@ -341,10 +347,10 @@ async def mirror_tidal_playlist(url: str) -> dict:
             code="not_authenticated", message=_generic_error_message(exc)
         ).model_dump()
 
-    download_root = Path(os.environ.get("SLSK_DOWNLOAD_DIR", "./downloads"))
+    download_root = get_download_dir()
     try:
         job_id = await _mirror.start_mirror(
-            url=url, slsk=_W, download_root=download_root
+            url=url, slsk=_W, download_root=download_root, formats=formats
         )
     except ValueError as exc:
         return ErrorResponse(code="invalid_params", message=str(exc)).model_dump()

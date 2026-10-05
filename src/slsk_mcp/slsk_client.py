@@ -23,6 +23,12 @@ from .models import (
 
 logger = logging.getLogger("slsk_mcp")
 
+
+def get_download_dir() -> Path:
+    """SLSK_DOWNLOAD_DIR with ``~`` and env vars expanded (default ./downloads)."""
+    raw = os.environ.get("SLSK_DOWNLOAD_DIR", "./downloads")
+    return Path(os.path.expandvars(os.path.expanduser(raw)))
+
 # Security hardening: override aioslsk's 0.0.0.0 default so we don't expose
 # the P2P listener to the LAN/WAN by default. User can opt back into the
 # upstream behavior with SLSK_BIND_HOST=0.0.0.0.
@@ -228,7 +234,7 @@ class SoulseekWrapper:
             settings.network.listening.error_mode,
         )
 
-        download_dir = os.environ.get("SLSK_DOWNLOAD_DIR", "./downloads")
+        download_dir = str(get_download_dir())
         settings.shares.download = download_dir
 
         self._client = SoulSeekClient(settings)
@@ -330,9 +336,34 @@ class SoulseekWrapper:
             logger.error("Reconnect failed: %s", msg)
         return ok
 
+    async def force_relogin(self) -> bool:
+        """Tear down the session and log in again, even if it looks healthy.
+
+        ``reconnect`` is a no-op while connected; this is for cases where the
+        session is up but misbehaving (e.g. every search returning nothing).
+        In-flight downloads from the old session become ``session_expired``.
+        """
+        user, pw = self._username, self._password
+        if not user or not pw:
+            return False
+        logger.warning("Forcing Soulseek re-login as %s", user)
+        async with self._conn_lock:
+            await self.logout()
+            ok, msg, _ = await self._login_inner(user, pw)
+        if ok:
+            logger.info("Forced re-login succeeded (session=%d)", self._session_id)
+        else:
+            logger.error("Forced re-login failed: %s", msg)
+        return ok
+
     # ── Search ───────────────────────────────────────────────────────────
 
-    async def search(
+    async def search(self, query: str, **kwargs: Any) -> List[SearchResultItem]:
+        """Run a network search and return sorted, filtered results."""
+        items, _raw = await self.search_counted(query, **kwargs)
+        return items
+
+    async def search_counted(
         self,
         query: str,
         timeout: Optional[int] = None,
@@ -344,8 +375,12 @@ class SoulseekWrapper:
         free_slots_only: bool = False,
         max_queue_size: Optional[int] = None,
         min_speed: Optional[int] = None,
-    ) -> List[SearchResultItem]:
-        """Run a network search and return sorted, filtered results."""
+    ) -> Tuple[List[SearchResultItem], int]:
+        """Like ``search`` but also returns the raw (pre-filter) result count.
+
+        A raw count of 0 means the network returned nothing at all, which is
+        distinguishable from "results existed but none passed the filters".
+        """
         assert self._client is not None
 
         if timeout is None:
@@ -419,16 +454,16 @@ class SoulseekWrapper:
             reverse=True,
         )
 
-        return items[:max_results]
+        return items[:max_results], len(request.results)
 
     # ── Download ─────────────────────────────────────────────────────────
 
     async def download(
-        self, file_id: str
+        self, file_id: str, dest_dir: Optional[Path] = None
     ) -> Tuple[bool, str, Optional[str], Optional[int]]:
         """Start a download. Returns (success, message, local_path, filesize).
 
-        Files are saved to SLSK_DOWNLOAD_DIR (set at login time).
+        Files are saved to ``dest_dir`` if given, else SLSK_DOWNLOAD_DIR.
         During transfer the file has a .part suffix; it is renamed to the
         final name only on successful completion.
         """
@@ -473,7 +508,7 @@ class SoulseekWrapper:
             # Build the final path and set .part path on the transfer so
             # aioslsk writes to the .part file directly.
             filename = remote_path.rsplit("\\", 1)[-1].rsplit("/", 1)[-1]
-            dl_dir = Path(os.environ.get("SLSK_DOWNLOAD_DIR", "./downloads"))
+            dl_dir = Path(dest_dir) if dest_dir is not None else get_download_dir()
             dl_dir.mkdir(parents=True, exist_ok=True)
             final_path = dl_dir / filename
             # Resolve collision on the final name
@@ -493,6 +528,9 @@ class SoulseekWrapper:
                 "finished_at": None,
                 "session_id": self._session_id,
                 "started_at": time.time(),
+                # The semaphore this download holds a slot on. A re-login
+                # replaces self._download_sem, so release must go to this one.
+                "sem": self._download_sem,
             }
             # Release semaphore when transfer completes (fire-and-forget)
             asyncio.get_event_loop().create_task(
@@ -510,10 +548,16 @@ class SoulseekWrapper:
         if not entry:
             return
         transfer: Transfer = entry["transfer"]
+        sem = entry.get("sem") or self._download_sem
+        state = "queued"
         try:
             while True:
                 state = self._transfer_state(transfer)
                 if state in ("finished", "failed", "cancelled"):
+                    break
+                # Session replaced (re-login): this transfer is dead.
+                if entry.get("session_id", 0) < self._session_id:
+                    state = "session_expired"
                     break
                 await asyncio.sleep(1)
             # Rename .part → final on success
@@ -524,8 +568,8 @@ class SoulseekWrapper:
                     part.rename(final)
                     logger.info("Renamed %s → %s", part.name, final.name)
         finally:
-            if self._download_sem:
-                self._download_sem.release()
+            if sem:
+                sem.release()
             entry["finished_at"] = time.time()
 
     def _transfer_state(self, transfer: Transfer) -> str:
